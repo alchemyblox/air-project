@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CircularProgressbar, buildStyles } from "react-circular-progressbar";
 import "react-circular-progressbar/dist/styles.css";
@@ -14,23 +14,11 @@ const ecoFacts = [
   "E-waste contains valuable metals like gold and silver—recycle to recover them."
 ];
 
-const I18N = {
-  en: { title: 'Air Quality Quiz', subtitle: 'Water · Energy · Waste — Calculate Your Eco Score', micro: {
-    shower_under5: 'Great — under 5 minutes!', shower_under10: 'Nice — under 10 minutes!', shower_long: 'Consider reducing shower time.',
-    devices_low: 'Excellent — low device usage!', devices_medium: 'Moderate device usage.', devices_high: 'High device usage — try to switch off idle devices.',
-    ac_low: 'Low AC usage — great!', ac_medium: 'Moderate AC usage — small improvements possible.', ac_high: 'High AC usage — try alternatives or timer.',
-    disposable_low: 'Very few disposables — nice!', disposable_many: 'High disposable use — try reusables.'
-  }},
-  hi: { title: 'हवा गुणवत्ता प्रश्नोत्तरी', subtitle: 'पानी · ऊर्जा · कचरा — अपना इको स्कोर कैलकुलेट करें', micro: {/* ... */} },
-  kn: { title: 'ಗಾಳಿ ಗುಣಮಟ್ಟ ಪ್ರಶ್ನಾವಳಿ', subtitle: 'ನೀರು · ಶಕ್ತಿ · ಕಸ — ನಿಮ್ಮ ಇಕೋ ಸ್ಕೋರ್ ಲೆಕ್ಕಾಚಾರ ಮಾಡಿ', micro: {/* ... */} }
-};
-
 const TIPS = {
   en: { pro: ["Carry a reusable bottle — avoid many disposables each year.", "Turn off chargers when not in use — they draw power idle.", "Try a 5-minute shower challenge once a week."],
         more: { water: ["Install a low-flow showerhead if possible.", "Turn off the tap while brushing teeth.", "Use a bucket when washing small loads."],
                 energy: ["Unplug devices while away.", "Use power strips to switch multiple devices off at once.", "Keep electronics dust-free."],
                 waste: ["Carry reusable cutlery and bottles.", "Buy loose produce instead of pre-packaged items.", "Donate old clothes instead of discarding."] } }
-  // hi / kn omitted in the snippet for brevity; add if needed
 };
 
 /* ---------- Helper Animations ---------- */
@@ -42,7 +30,7 @@ export default function App() {
   /* --- state (kept & preserved) --- */
   const [selectedFile, setSelectedFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState("");
-  const [result, setResult] = useState(null);
+  const [result, setResult] = useState(null); // expects { name, description, confidences? }
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [fact, setFact] = useState(ecoFacts[Math.floor(Math.random() * ecoFacts.length)]);
@@ -52,72 +40,94 @@ export default function App() {
   });
   const [quizScores, setQuizScores] = useState(null);
   const [showConfetti, setShowConfetti] = useState(false);
-  const [records, setRecords] = useState(JSON.parse(localStorage.getItem('sustainify_records') || '[]'));
+  const [records, setRecords] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('sustainify_records') || '[]'); } catch { return []; }
+  });
   const [showMoreTips, setShowMoreTips] = useState(false);
   const [flashMessage, setFlashMessage] = useState("");
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
-    // save records on unmount change
     localStorage.setItem('sustainify_records', JSON.stringify(records));
   }, [records]);
 
-  /* ---------- File upload / AI identify ---------- */
+  // revoke object URLs to avoid memory leaks
+  useEffect(() => {
+    return () => {
+      if (previewUrl && previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  /* ---------- File upload / AI identify (Gemini support) ---------- */
   const handleFileChange = (e) => {
-    const file = e.target.files[0];
+    const file = e.target.files?.[0] || null;
     if (file) {
+      if (previewUrl && previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl);
       setSelectedFile(file);
       setPreviewUrl(URL.createObjectURL(file));
       setResult(null);
       setError("");
+    } else {
+      setSelectedFile(null);
+      if (previewUrl && previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl);
+      setPreviewUrl("");
     }
   };
 
-  const handleIdentify = async () => {
-  if (!selectedFile) {
-    setError("Please select an image to proceed.");
-    flashy("Select an image first.");
-    return;
-  }
-
-  setLoading(true);
-  setError("");
-  setResult(null);
-
-  try {
-    // Convert file → base64
+  // Convert file to base64 (returns Promise)
+  const fileToBase64 = (file) => new Promise((resolve, reject) => {
     const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.readAsDataURL(file);
+  });
 
-    reader.onloadend = async () => {
-      const base64 = reader.result.split(",")[1]; // remove prefix
+  const handleIdentify = async () => {
+    if (loading) return; // avoid double clicks
+    if (!selectedFile) {
+      setError("Please select an image to proceed.");
+      flashy("Select an image first.");
+      return;
+    }
 
-      try {
-        const res = await axios.post(
-          "http://localhost:5000/identify", // backend endpoint
-          { image: base64 } // send base64 string
-        );
+    setLoading(true);
+    setError("");
+    setResult(null);
 
-        setResult(res.data); // display result
+    try {
+      const base64 = await fileToBase64(selectedFile);
+
+      // send to backend (which now may be Gemini-based). Keep same contract: { image: base64 }
+      const res = await axios.post('/identify', { image: base64 }, { timeout: 25000 });
+
+      // Expected responses handled gracefully:
+      // { name, description }
+      // or { name, description, confidences: [{name, prob}, ...] }
+      if (res && res.data) {
+        setResult(res.data);
         setFact(ecoFacts[Math.floor(Math.random() * ecoFacts.length)]);
-        flashy("Identification complete!");
-      } catch (err) {
-        console.error(err);
-        setError(err.response?.data?.error || "Identification failed. Try again later.");
-      } finally {
-        setLoading(false);
+        flashy('Identification complete!');
+      } else {
+        setError('No data returned from server');
       }
-    };
+    } catch (err) {
+      console.error('identify err', err);
+      if (axios.isCancel(err)) setError('Request cancelled');
+      else if (err.code === 'ECONNABORTED') setError('Request timed out');
+      else if (err.response) {
+        const status = err.response.status;
+        if (status === 413) setError('Image too large for server');
+        else if (status === 504) setError('Server timed out processing the image');
+        else setError(err.response.data?.error || 'Server error');
+      } else {
+        setError('Identification failed. Check console for details.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
 
-    reader.readAsDataURL(selectedFile);
-  } catch (err) {
-    console.error(err);
-    setError("Failed to process the image.");
-    setLoading(false);
-  }
-};
-
-
-
-  /* ---------- Quiz scoring ---------- */
+  /* ---------- Quiz scoring (unchanged) ---------- */
   const computeScores = (inputs) => {
     let water = 30;
     if (inputs.uses_bucket) water += 10;
@@ -156,13 +166,13 @@ export default function App() {
       setShowConfetti(true);
       setTimeout(() => setShowConfetti(false), 4500);
     }
-    flashy("Score calculated!");
+    flashy('Score calculated!');
   };
 
   /* ---------- UI helpers ---------- */
   const flashy = (text) => {
     setFlashMessage(text);
-    setTimeout(() => setFlashMessage(""), 3000);
+    setTimeout(() => setFlashMessage(''), 3000);
   };
 
   const renderBadges = () => {
@@ -184,13 +194,13 @@ export default function App() {
   const exportCSV = () => {
     const csv = [
       'ts,name,shower_min,uses_bucket,hours_devices,num_led,ac_hours,uses_reusable,recycles,disposable_count,eco',
-      ...records.map(r => `${r.ts},${r.name},${r.inputs.shower_min},${r.inputs.uses_bucket},${r.inputs.hours_devices},${r.inputs.num_led},${r.inputs.ac_hours},${r.inputs.uses_reusable},${r.inputs.recycles},${r.inputs.disposable_count},${r.scores.eco}`)
+      ...records.map(r => `"${r.ts}","${r.name}",${r.inputs.shower_min},${r.inputs.uses_bucket},${r.inputs.hours_devices},${r.inputs.num_led},${r.inputs.ac_hours},${r.inputs.uses_reusable},${r.inputs.recycles},${r.inputs.disposable_count},${r.scores.eco}`)
     ].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = 'sustainify_records.csv'; a.click();
     URL.revokeObjectURL(url);
-    flashy("CSV exported");
+    flashy('CSV exported');
   };
 
   /* ---------- Small UI blocks (hero, features) ---------- */
@@ -258,8 +268,8 @@ export default function App() {
             <div className="grid two">
               <motion.div className="card upload-card" {...cardPop} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
                 <h3>🔍 Identify an item</h3>
-                <label className="file-input">
-                  <input type="file" accept="image/*" onChange={handleFileChange} />
+                <label className="file-input" aria-label="Upload an image">
+                  <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} disabled={loading} />
                   <span>{selectedFile ? selectedFile.name : "Choose or drag an image"}</span>
                 </label>
 
@@ -274,6 +284,19 @@ export default function App() {
                   <div className="result">
                     <h4>{result.name || "Result"}</h4>
                     <p className="muted">{result.description || JSON.stringify(result)}</p>
+
+                    {/* show confidences if provided by Gemini backend */}
+                    {Array.isArray(result.confidences) && result.confidences.length > 0 && (
+                      <div className="confidences">
+                        <h5>Alternatives</h5>
+                        <ul>
+                          {result.confidences.map((c, i) => (
+                            <li key={i}>{c.name}{typeof c.prob === 'number' ? ` — ${Math.round(c.prob*100)}%` : ''}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
                     <div className="fact">{fact}</div>
                   </div>
                 )}
