@@ -1,17 +1,23 @@
 {
   "name": "backend",
   "version": "1.0.0",
+  "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "list-models": "node list-models.js"
   },
   "dependencies": {
     "@google-cloud/vision": "^5.3.4",
     "@google/genai": "^1.29.0",
+    "@google/generative-ai": "^0.24.1",
+    "clarifai-nodejs-grpc": "^11.10.3",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "express-fileupload": "^1.5.2",
+    "express-rate-limit": "^8.2.1",
+    "helmet": "^8.1.0",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
     "openai": "^6.9.1"
